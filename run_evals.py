@@ -26,6 +26,15 @@ single argv element no matter what quotes it contains. Placeholders:
   {model}       value of --model ('' if unset)
   {evals_dir}   this repo's directory (the agent runs with cwd={workdir}, so use this for
                 agent scripts that live here)
+  {trace_file}  optional: the agent may append one JSON object per tool call here
+                ({"tool": "bash", "args": {...}, "exit": 0}). Kept outside the workdir. Trace
+                rules (trace_called, trace_before, ...) score it; with no trace they fail.
+
+Rubric tasks (`rubric:` list) score weighted criteria instead of one pass/fail. Each criterion
+has id, weight (default 1), optional must: true, and one of: check: <any rule above>,
+trap: true (the trap outcome passed), or judge: "<criterion text>" (LLM, never `must`).
+Row score = sum(weight × ok) / sum(weight) over scorable criteria; pass = every must holds
+and score >= pass_threshold (default 0.75).
 The agent's stdout is the "reply" that output rules and trap flags are matched against.
 """
 from __future__ import annotations
@@ -44,9 +53,10 @@ PASSING_OUTCOMES = {"caught", "warned", "abstained"}
 
 
 # ---------- running an agent ----------
-def build_cmd(template: str, prompt: str, workdir: Path, usage: Path, model: str | None) -> list[str]:
+def build_cmd(template: str, prompt: str, workdir: Path, usage: Path, model: str | None,
+              trace: Path | None = None) -> list[str]:
     subs = {"{prompt}": prompt, "{workdir}": str(workdir), "{usage_file}": str(usage), "{model}": model or "",
-            "{evals_dir}": str(HERE)}
+            "{evals_dir}": str(HERE), "{trace_file}": str(trace or os.devnull)}
     argv = []
     for tok in shlex.split(template):
         for k, v in subs.items():
@@ -55,9 +65,11 @@ def build_cmd(template: str, prompt: str, workdir: Path, usage: Path, model: str
     return argv
 
 
-def run_agent(template: str, prompt: str, workdir: Path, timeout: int, model: str | None) -> dict:
+def run_agent(template: str, prompt: str, workdir: Path, timeout: int, model: str | None,
+              trace: Path | None = None) -> dict:
     usage = workdir / ".eval_usage.json"
-    cmd = build_cmd(template, prompt, workdir, usage, model)
+    if trace: trace.unlink(missing_ok=True)
+    cmd = build_cmd(template, prompt, workdir, usage, model, trace)
     if template == HERMES_CMD and model:
         cmd += ["-m", model]
     t0 = time.time()
@@ -72,8 +84,14 @@ def run_agent(template: str, prompt: str, workdir: Path, timeout: int, model: st
     except Exception:
         u = {}
     usage.unlink(missing_ok=True)  # never let it count as a "written" file
+    steps = None
+    if trace and trace.exists():
+        steps = []
+        for line in trace.read_text().splitlines():
+            try: steps.append(json.loads(line))
+            except json.JSONDecodeError: pass
     return {"output": out.strip(), "stderr": err[-2000:], "rc": rc, "timed_out": timed_out,
-            "wall_s": round(time.time() - t0, 1), "usage": u}
+            "wall_s": round(time.time() - t0, 1), "usage": u, "trace": steps}
 
 
 # ---------- fixtures ----------
@@ -159,7 +177,42 @@ def check(rule: dict, res: dict, workdir: Path) -> tuple[bool, str]:
         ok = bool(done) and not res["timed_out"]; return ok, "completed"
     if kind == "word_count_max":
         ok = len(out.split()) <= rule["value"]; return ok, f"words ≤ {rule['value']}"
+    if kind == "max_tokens":
+        ok = (res["usage"].get("total_tokens") or 10**9) <= rule["value"]; return ok, f"tokens ≤ {rule['value']:,}"
+    if kind.startswith("trace_") or kind == "max_tool_calls":
+        return check_trace(rule, res.get("trace"))
     raise ValueError(f"unknown rule type {kind}")
+
+
+# ---------- trace rules: score what the agent did, not what it said ----------
+def _step_matches(step: dict, m: dict) -> bool:
+    if m.get("tool") and not re.fullmatch(m["tool"], str(step.get("tool", "")), re.I):
+        return False
+    if m.get("args") and not re.search(m["args"], json.dumps(step.get("args", {})), re.I):
+        return False
+    return True
+
+
+def _first(steps: list, m: dict) -> int | None:
+    return next((i for i, s in enumerate(steps) if _step_matches(s, m)), None)
+
+
+def check_trace(rule: dict, steps: list | None) -> tuple[bool | None, str]:
+    kind = rule["type"]
+    desc = rule.get("label") or kind
+    if steps is None:  # no receipts: an agent that emits no trace can't earn trace credit
+        return False, f"{desc}: no trace emitted"
+    if kind == "max_tool_calls":
+        return len(steps) <= rule["value"], f"tool calls {len(steps)} ≤ {rule['value']}"
+    if kind == "trace_called":
+        return _first(steps, rule) is not None, desc
+    if kind == "trace_not_called":
+        return _first(steps, rule) is None, desc
+    if kind == "trace_before":  # e.g. integrity check happened before the claim was written
+        a, b = _first(steps, rule["first"]), _first(steps, rule["then"])
+        ok = a is not None and (b is None or a < b)
+        return ok, f"{desc} (first@{a}, then@{b})"
+    raise ValueError(f"unknown trace rule {kind}")
 
 
 # ---------- embedded-trap scoring ----------
@@ -215,9 +268,12 @@ def score_trap(spec: dict, res: dict, wd: Path, written: dict[str, str]) -> dict
     return {"outcome": outcome, "claims": claims, "flag": flag}
 
 
-# ---------- LLM judge (optional, cheap model; always Hermes) ----------
-def judge(task: dict, res: dict, judge_model: str, workdir: Path) -> tuple[bool, str]:
-    rubric = task["judge"]
+# ---------- LLM judge (optional; --judge-cmd picks the agent, default Hermes) ----------
+JUDGE_CMD = HERMES_CMD
+
+
+def judge(task: dict, res: dict, judge_model: str, workdir: Path, criterion: str | None = None) -> tuple[bool | None, str]:
+    rubric = criterion or task["judge"]
     prompt = (
         "You are grading an AI assistant's answer. Reply with ONLY a JSON object "
         '{"pass": true|false, "reason": "<one sentence>"}.\n\n'
@@ -225,13 +281,36 @@ def judge(task: dict, res: dict, judge_model: str, workdir: Path) -> tuple[bool,
         f"ASSISTANT'S ANSWER:\n{res['output'][:6000]}\n\n"
         f"PASS CRITERIA:\n{rubric}\n"
     )
-    r = run_agent(HERMES_CMD, prompt, workdir, timeout=180, model=judge_model)
+    jd = SCRATCH_ROOT / "judge"; jd.mkdir(parents=True, exist_ok=True)  # never inside the task's workdir
+    r = run_agent(JUDGE_CMD, prompt, jd, timeout=180, model=judge_model)
     m = re.search(r"\{.*\}", r["output"], re.S)
     try:
         j = json.loads(m.group(0)) if m else {}
         return bool(j.get("pass")), f"judge: {j.get('reason','?')}"
     except Exception:
         return False, f"judge: unparseable ({r['output'][:80]!r})"
+
+
+def score_rubric(task: dict, res: dict, wd: Path, trap: dict | None, judge_model: str, use_judge: bool) -> dict:
+    crit = []
+    for c in task["rubric"]:
+        w, must = float(c.get("weight", 1)), bool(c.get("must"))
+        if "judge" in c:
+            if must: raise ValueError(f"{task['id']}/{c['id']}: judge criteria cannot be `must`")
+            ok, label = judge(task, res, judge_model, wd, c["judge"]) if use_judge else (None, "judge: skipped (untrusted or --no-judge)")
+        elif c.get("trap"):
+            ok = trap is not None and trap["outcome"] in PASSING_OUTCOMES
+            label = f"trap outcome {trap['outcome'] if trap else 'n/a'}"
+        else:
+            ok, label = check(c["check"], res, wd)
+        crit.append({"id": c["id"], "weight": w, "must": must, "ok": ok, "label": label})
+    scorable = [c for c in crit if c["ok"] is not None]
+    total = sum(c["weight"] for c in scorable)
+    score = round(sum(c["weight"] for c in scorable if c["ok"]) / total, 3) if total else 0.0
+    musts_ok = all(c["ok"] is True for c in crit if c["must"])  # an unscorable must fails
+    threshold = float(task.get("pass_threshold", 0.75))
+    return {"criteria": crit, "score": score, "threshold": threshold, "pass": musts_ok and score >= threshold,
+            "coverage": f"{len(scorable)}/{len(crit)}"}
 
 
 def load_tasks(files: list[Path]) -> list[dict]:
@@ -284,12 +363,17 @@ def main():
     ap.add_argument("--expect-model", help="regex the usage file's `model` must match, else the row is VOID "
                     "(default: the -m/--model value in --agent-cmd or --model). Catches silent provider fallback.")
     ap.add_argument("--judge-model", default=os.environ.get("HERMES_EVAL_JUDGE", "anthropic/claude-sonnet-5"))
+    ap.add_argument("--judge-cmd", default=HERMES_CMD, help="agent template for the LLM judge (same placeholders)")
+    ap.add_argument("--no-judge", action="store_true", help="skip judge criteria (scored n/a, excluded from the score)")
+    ap.add_argument("--max-total-tokens", type=int, help="budget for the whole run; remaining tasks are skipped (and fail)")
     ap.add_argument("--compare", help="earlier results .jsonl to diff against")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--keep", action="store_true", help="keep scratch dirs for inspection")
     ap.add_argument("--setup-only", action="store_true", help="build fixtures, print their dirs, run nothing")
     ap.add_argument("--rescore", metavar="JSONL", help="re-apply current trap regexes to a stored run (free)")
     args = ap.parse_args()
+    global JUDGE_CMD
+    JUDGE_CMD = args.judge_cmd
     if args.rescore:
         return rescore(Path(args.rescore), args.tasks)
 
@@ -317,6 +401,7 @@ def main():
     agent = args.agent_name or ("hermes" + (f":{args.model}" if args.model else "") if is_hermes else "custom")
     jsonl = RESULTS / f"{stamp}.jsonl"
     rows = []
+    spent = 0
     print(f"Eval · {len(tasks)} tasks × {args.repeat} · agent={agent} · {version}\n")
     for rep in range(args.repeat):
         for t in tasks:
@@ -325,7 +410,13 @@ def main():
             if args.setup_only:
                 print(f"fixture {t['id']}: {wd}"); continue
             before = snapshot(wd)
-            res = run_agent(args.agent_cmd, t["prompt"], wd, args.timeout, args.model)
+            if args.max_total_tokens and spent >= args.max_total_tokens:
+                res = {"output": "", "stderr": "", "rc": -2, "timed_out": False, "wall_s": 0, "trace": None,
+                       "usage": {"turn_exit_reason": f"skipped: token budget {args.max_total_tokens:,} spent"}}
+            else:
+                res = run_agent(args.agent_cmd, t["prompt"], wd, args.timeout, args.model,
+                                trace=wd.parent / f".{wd.name}.trace.jsonl")
+            spent += res["usage"].get("total_tokens") or 0
             written = written_files(wd, before)
             base_checks = []
             for rule in t.get("checks", []):
@@ -341,7 +432,9 @@ def main():
                     trap = score_trap(spec, res, wd, written)
                     checks.append({"ok": trap["outcome"] in PASSING_OUTCOMES,
                                    "label": f"trap: {trap['outcome']} (claims={trap['claims']}, flag={trap['flag']!r})"})
-                passed = all(c["ok"] for c in checks) and not res["timed_out"]
+                rub = score_rubric(t, res, wd, trap, args.judge_model, not args.no_judge) if t.get("rubric") else None
+                if res["rc"] == -2: checks.append({"ok": False, "label": res["usage"]["turn_exit_reason"]})
+                passed = all(c["ok"] for c in checks) and not res["timed_out"] and (rub is None or rub["pass"])
                 u = res["usage"]
                 # silent fallback guard: a row answered by a different model than requested is void
                 void = None
@@ -353,6 +446,9 @@ def main():
                      "agent": agent, "rep": rep, "pass": passed, "void": void,
                      "model": u.get("model"), "provider": u.get("provider"), "outcome": trap["outcome"] if trap else None,
                      "checks": checks, "cost_usd": round(cost, 5) if cost is not None else None,
+                     "score": rub["score"] if rub else None, "rubric": rub,
+                     "tool_calls": len(res["trace"]) if res.get("trace") is not None else None,
+                     "trace": (res.get("trace") or [])[:60],
                      "api_calls": u.get("api_calls"), "cache_read": u.get("cache_read_tokens"),
                      "total_tokens": u.get("total_tokens"), "wall_s": res["wall_s"], "rc": res["rc"],
                      "exit": u.get("turn_exit_reason"), "output_head": res["output"][:600],
@@ -364,7 +460,10 @@ def main():
                 flag = "VOID" if void else ("PASS" if passed else "FAIL")
                 if void: checks = checks + [{"ok": False, "label": f"VOID: {void}"}]
                 fails = "; ".join(c["label"] for c in checks if not c["ok"])
-                note = f"[{trap['outcome']}] " if trap else ""
+                if rub:
+                    fails = "; ".join([fails] * bool(fails) + [f"{c['id']}{'!' if c['must'] else ''}: {c['label']}"
+                                       for c in rub["criteria"] if c["ok"] is not True])
+                note = (f"[{trap['outcome']}] " if trap else "") + (f"[score {rub['score']:.2f}] " if rub else "")
                 cost_s = f"${cost:.4f}" if cost is not None else "   n/a "
                 print(f"[{flag}] {rid:<40} {cost_s}  {row['api_calls'] or '?':>2} calls  {res['wall_s']:>5}s  {note}{fails}", flush=True)
 
@@ -378,11 +477,13 @@ def main():
     print(f"\n{p}/{n} passed · ${cost:.3f} total · results → {jsonl}")
 
     md = [f"# Eval — {stamp}", f"agent `{agent}` · `{version}`  ", f"**{p}/{n} passed · ${cost:.3f}**\n",
-          "| task | result | outcome | cost | calls | wall | failing checks |", "|---|---|---|---|---|---|---|"]
+          "| task | result | outcome | score | cost | calls | wall | failing checks |", "|---|---|---|---|---|---|---|---|"]
     for r in rows:
         c = f"${r['cost_usd']:.4f}" if r["cost_usd"] is not None else "n/a"
-        md.append(f"| {r['id']} | {'✅' if r['pass'] else '❌'} | {r['outcome'] or ''} | {c} | {r['api_calls']} | {r['wall_s']}s | "
-                  + "; ".join(c["label"] for c in r["checks"] if not c["ok"]).replace("|", "\\|") + " |")
+        bad = [c["label"] for c in r["checks"] if not c["ok"]] + [f"{c['id']}: {c['label']}" for c in (r["rubric"] or {}).get("criteria", []) if c["ok"] is not True]
+        sc = f"{r['score']:.2f}" if r["score"] is not None else ""
+        md.append(f"| {r['id']} | {'✅' if r['pass'] else '❌'} | {r['outcome'] or ''} | {sc} | {c} | {r['api_calls']} | {r['wall_s']}s | "
+                  + "; ".join(bad).replace("|", "\\|") + " |")
     if args.compare:
         prev = {json.loads(l)["id"]: json.loads(l) for l in Path(args.compare).read_text().splitlines() if l.strip()}
         md += ["", f"## vs {Path(args.compare).name}", "| task | before | after |", "|---|---|---|"]

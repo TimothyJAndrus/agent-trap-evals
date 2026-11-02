@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "agent": "bare:glm-5.3",
+    "model": "glm-5.3"
+  },
+  "tasks": {
+    "rubric-backup-truncated": {
+      "pass_rate": 1.0,
+      "runs": 2,
+      "score": 1.0
+    },
+    "rubric-ci-summary-partial": {
+      "pass_rate": 1.0,
+      "runs": 2,
+      "score": 1.0
+    },
+    "rubric-config-env-override": {
+      "pass_rate": 1.0,
+      "runs": 2,
+      "score": 1.0
+    }
+  }
+}
