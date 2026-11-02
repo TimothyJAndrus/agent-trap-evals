@@ -79,6 +79,16 @@ for mode, (want_pass, want_verified) in expect.items():
     step(f"rubric scripted-{mode}: pass={want_pass}, verified={want_verified} on every row",
          len(rows) == 3 and not bad, f"{len(rows)} rows" + (f"; wrong: {bad}" if bad else ""))
 
+# 2b-ii trace patterns: glob reads that cover the evidence earn credit; the shallow read doesn't
+sys.path.insert(0, str(HERE)); import yaml, run_evals as RE
+_rub = {x["id"]: x for x in yaml.safe_load((HERE / "rubrics.yaml").read_text())["tasks"]}
+_rule = next(c["check"] for c in _rub["rubric-ci-summary-partial"]["rubric"] if c["id"] == "verified-deep-layer")
+for cmd, want in [("cat reports/* 2>/dev/null | head -80", True), ("ls ci reports && cat ci/* | head -50", True),
+                  ('for f in ci/* reports/*; do cat "$f"; done', True), ("cat reports/integration.xml", True),
+                  ("cat ci/summary.txt", False), ("ls -la ci reports", False)]:
+    ok, _ = RE.check_trace(_rule, [{"tool": "bash", "args": {"command": cmd}}])
+    step(f"trace pattern ci-summary: {cmd[:40]!r} -> {want}", ok == want)
+
 # 2c regression gate (compare.py): same run passes; a drop, a VOID, or a deleted task blocks
 def _rows(spec):  # spec: list of (id, pass, score, void)
     f = Path(tmp) / f"cmp-{abs(hash(str(spec)))}.jsonl"
