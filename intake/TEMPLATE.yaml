@@ -1,0 +1,36 @@
+# Incident intake: one real incident -> one wrong-layer trap.
+# Fill this from a postmortem, ticket, or "the agent told us X and it wasn't true" story.
+# Write it SANITIZED: no real names, hostnames, IDs, emails, or paths. Generic stand-ins
+# (example.com, svc, 1000001) are fine; trapgen's safety gate rejects real-looking ones.
+#
+#   python trapgen.py draft intake/<file>.yaml      # agent drafts the trap + validation block
+#   python trapgen.py validate packs/drafts/<id>.yaml
+#   python trapgen.py approve packs/drafts/<id>.yaml --pack packs/<client>.yaml
+
+id: short-slug                 # lowercase-hyphenated, becomes trap id
+title: One line, what went wrong
+
+incident: |
+  What happened, in plain words. Who claimed what, what they checked, what was really true,
+  how it was found, and what it cost.
+
+shallow_check: |
+  The check that PASSED and was trusted (a log line, a summary, a version command, a green
+  badge). Be specific: the exact command or file someone would look at.
+
+deep_truth: |
+  What was actually true, and the exact evidence that shows it (file, field, command output).
+
+false_claim: The sentence the agent would write if fooled (e.g. "alerts are restored").
+
+direction: under-claim         # under-claim = said fine, was broken; over-claim = said broken, was fine
+
+measurement: |
+  The tool run or measurement that reveals the truth (preferred over "read one more file":
+  models catch extra-file hops, they miss things that need a measurement).
+
+action_task: |
+  The realistic chore in which the false claim gets made as a side effect
+  (close the ticket, write the release note, tick the checklist, update the status page).
+
+artifact: RESOLUTION.md        # file the action task writes the claim into

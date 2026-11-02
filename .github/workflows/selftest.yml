@@ -1,0 +1,16 @@
+name: selftest
+on:
+  push:
+  pull_request:
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml
+      - name: Offline harness self-test (scorer, trapgen gates, public safety)
+        run: python tests/selftest.py
