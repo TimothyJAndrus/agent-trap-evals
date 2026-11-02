@@ -31,7 +31,7 @@ jobs:
           VULTR_INFERENCE_API_KEY: ${{ secrets.VULTR_INFERENCE_API_KEY }}
         run: |
           test -n "$VULTR_INFERENCE_API_KEY" || { echo "::error::VULTR_INFERENCE_API_KEY secret not set"; exit 1; }
-          python run_evals.py --tasks traps.yaml rubrics.yaml --tag rubric --no-judge --repeat 2 \
+          python run_evals.py --tasks traps.yaml rubrics.yaml --tag rubric --no-judge --repeat 3 \
             --model "$MODEL" --agent-name "bare:$MODEL" --max-total-tokens 400000 \
             --agent-cmd "python3 {evals_dir}/agents/bare_agent.py --prompt {prompt} --cwd {workdir} --usage {usage_file} --trace {trace_file} --model {model} --base-url $BASE_URL" \
             || true   # the gate below decides; individual task failures are data

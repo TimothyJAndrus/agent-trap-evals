@@ -78,7 +78,7 @@ Trace rules: `trace_called`, `trace_not_called`, `trace_before` (`first` / `then
 | workflow | when | what | blocks merge? |
 |---|---|---|---|
 | `selftest.yml` | every push / PR | offline: compile, scripted agents vs scorer (trap + rubric + trace), compare.py gate cases, trapgen gates, flag recall, public safety. No LLM, no cost | yes |
-| `eval-gate.yml` | same-repo PRs | rubric set against a live model (`glm-5.3`, ×2 repeats, 400k-token cap), then `compare.py` vs `baselines/ci.json`, sticky PR comment with the diff table | yes, on any pass-rate drop ≥ 50 pts, rubric score drop > 0.15, VOID row, or deleted task |
+| `eval-gate.yml` | same-repo PRs | rubric set against a live model (`glm-5.3`, ×3 repeats, 400k-token cap), then `compare.py` vs `baselines/ci.json`, sticky PR comment with the diff table | yes, on any pass-rate drop ≥ 50 pts, rubric score drop > 0.15, VOID row, or deleted task |
 | `ai-review.yml` | same-repo PRs | an LLM reviews the diff against [`REVIEW_RUBRIC.md`](REVIEW_RUBRIC.md); every finding must quote a real diff line or it's dropped as unsupported | no (advisory) |
 
 Trust boundaries: no `pull_request_target`; secrets only on same-repo PRs; the reviewer runs code and rubric **from the base branch** and only reads the PR diff, so a PR can't rewrite its own reviewer.
@@ -94,7 +94,7 @@ python compare.py results/<run>.jsonl --write-baseline baselines/ci.json        
 - Regex scoring is checked against scripted agents and audited by hand, but a novel phrasing can still miss a flag (it scores as abstained, which passes, not as fooled).
 - Single runs in the scoreboard. Rates need `--repeat N`.
 - The LLM judge defaults to the Hermes CLI; pass `--judge-cmd` with any agent template, or `--no-judge`. CI runs `--no-judge`, so judge criteria are excluded from the gated score.
-- The CI baseline is 2 repeats of 3 rubric tasks: a smoke gate, not a benchmark. Flaky tasks will need more repeats.
+- The CI gate runs 3 repeats of 3 rubric tasks (one slip in 3 is tolerated, two block): a smoke gate, not a benchmark. Flaky tasks will need more repeats.
 
 ## License
 MIT. Built by Timothy Andrus ([AITeCXO](https://aitecxo.com)).
