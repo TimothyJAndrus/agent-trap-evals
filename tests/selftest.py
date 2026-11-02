@@ -33,7 +33,8 @@ def run(args: list[str], env: dict | None = None) -> subprocess.CompletedProcess
 
 
 # 1 compile
-for f in ["run_evals.py", "compare.py", "review_pr.py", "scoreboard.py", "trapgen.py", "agents/scripted_agent.py", "intake/sheet_to_intake.py"]:
+for f in ["run_evals.py", "compare.py", "review_pr.py", "scoreboard.py", "trapgen.py", "trap_evals_mcp.py",
+          "agents/scripted_agent.py", "intake/sheet_to_intake.py"]:
     try:
         py_compile.compile(str(HERE / f), doraise=True); step(f"compile {f}", True)
     except py_compile.PyCompileError as e:

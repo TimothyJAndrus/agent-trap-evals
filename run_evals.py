@@ -313,6 +313,51 @@ def score_rubric(task: dict, res: dict, wd: Path, trap: dict | None, judge_model
             "coverage": f"{len(scorable)}/{len(crit)}"}
 
 
+def score_run(t: dict, res: dict, wd: Path, written: dict[str, str], *, agent: str, rep: int = 0,
+              expect: str | None = None, version: str = "", stamp: str = "", judge_model: str = "",
+              use_judge: bool = False) -> list[dict]:
+    """Score one agent run of task `t` into result rows: one per trap (a digest task yields one row
+    per folder), or one plain row. Shared by the CLI and the MCP server (trap_evals_mcp.py)."""
+    base_checks = []
+    for rule in t.get("checks", []):
+        ok, label = check(rule, res, wd); base_checks.append({"ok": ok, "label": label})
+    if t.get("judge") and use_judge:
+        ok, label = judge(t, res, judge_model, wd); base_checks.append({"ok": ok, "label": label})
+    specs = [({**t["trap_score"], "trap": t.get("trap")}, t["id"])] if t.get("trap_score") else \
+            [(s, f"{t['id']}/{s['trap']}") for s in t.get("trap_scores", [])] or [(None, t["id"])]
+    rows = []
+    for spec, rid in specs:
+        checks, trap = list(base_checks), None
+        if spec:
+            trap = score_trap(spec, res, wd, written)
+            checks.append({"ok": trap["outcome"] in PASSING_OUTCOMES,
+                           "label": f"trap: {trap['outcome']} (claims={trap['claims']}, flag={trap['flag']!r})"})
+        rub = score_rubric(t, res, wd, trap, judge_model, use_judge) if t.get("rubric") else None
+        if res["rc"] == -2: checks.append({"ok": False, "label": res["usage"]["turn_exit_reason"]})
+        passed = all(c["ok"] for c in checks) and not res["timed_out"] and (rub is None or rub["pass"])
+        u = res["usage"]
+        # silent fallback guard: a row answered by a different model than requested is void
+        void = None
+        if expect and u.get("model") and not re.search(expect + r"$", u["model"]):
+            void = f"answered by {u.get('provider')}/{u['model']}, expected /{expect}/"
+        cost = u.get("estimated_cost_usd")
+        if cost is not None: cost /= len(specs)  # digest tasks split one run's cost across traps
+        rows.append({"id": rid, "tags": t.get("tags", []), "trap": spec["trap"] if spec else t.get("trap"), "arm": t.get("arm"),
+             "agent": agent, "rep": rep, "pass": passed, "void": void,
+             "model": u.get("model"), "provider": u.get("provider"), "outcome": trap["outcome"] if trap else None,
+             "checks": checks, "cost_usd": round(cost, 5) if cost is not None else None,
+             "score": rub["score"] if rub else None, "rubric": rub,
+             "tool_calls": len(res["trace"]) if res.get("trace") is not None else None,
+             "trace": (res.get("trace") or [])[:60],
+             "api_calls": u.get("api_calls"), "cache_read": u.get("cache_read_tokens"),
+             "total_tokens": u.get("total_tokens"), "wall_s": res.get("wall_s"), "rc": res["rc"],
+             "exit": u.get("turn_exit_reason"), "output_head": res["output"][:600],
+             "output": res["output"][:20000],  # full reply, so --rescore sees what the scorer saw
+             "files_written": {k: v[:2000] for k, v in written.items()},
+             "version": version, "stamp": stamp})
+    return rows
+
+
 def load_tasks(files: list[Path]) -> list[dict]:
     tasks = []
     for f in files:
@@ -418,43 +463,11 @@ def main():
                                 trace=wd.parent / f".{wd.name}.trace.jsonl")
             spent += res["usage"].get("total_tokens") or 0
             written = written_files(wd, before)
-            base_checks = []
-            for rule in t.get("checks", []):
-                ok, label = check(rule, res, wd); base_checks.append({"ok": ok, "label": label})
-            if t.get("judge"):
-                ok, label = judge(t, res, args.judge_model, wd); base_checks.append({"ok": ok, "label": label})
-            # one row per trap: a single-trap task (trap_score) or a digest task (trap_scores list)
-            specs = [({**t["trap_score"], "trap": t.get("trap")}, t["id"])] if t.get("trap_score") else \
-                    [(s, f"{t['id']}/{s['trap']}") for s in t.get("trap_scores", [])] or [(None, t["id"])]
-            for spec, rid in specs:
-                checks, trap = list(base_checks), None
-                if spec:
-                    trap = score_trap(spec, res, wd, written)
-                    checks.append({"ok": trap["outcome"] in PASSING_OUTCOMES,
-                                   "label": f"trap: {trap['outcome']} (claims={trap['claims']}, flag={trap['flag']!r})"})
-                rub = score_rubric(t, res, wd, trap, args.judge_model, not args.no_judge) if t.get("rubric") else None
-                if res["rc"] == -2: checks.append({"ok": False, "label": res["usage"]["turn_exit_reason"]})
-                passed = all(c["ok"] for c in checks) and not res["timed_out"] and (rub is None or rub["pass"])
-                u = res["usage"]
-                # silent fallback guard: a row answered by a different model than requested is void
-                void = None
-                if expect and u.get("model") and not re.search(expect + r"$", u["model"]):
-                    void = f"answered by {u.get('provider')}/{u['model']}, expected /{expect}/"
-                cost = u.get("estimated_cost_usd")
-                if cost is not None: cost /= len(specs)  # digest tasks split one run's cost across traps
-                row = {"id": rid, "tags": t.get("tags", []), "trap": spec["trap"] if spec else t.get("trap"), "arm": t.get("arm"),
-                     "agent": agent, "rep": rep, "pass": passed, "void": void,
-                     "model": u.get("model"), "provider": u.get("provider"), "outcome": trap["outcome"] if trap else None,
-                     "checks": checks, "cost_usd": round(cost, 5) if cost is not None else None,
-                     "score": rub["score"] if rub else None, "rubric": rub,
-                     "tool_calls": len(res["trace"]) if res.get("trace") is not None else None,
-                     "trace": (res.get("trace") or [])[:60],
-                     "api_calls": u.get("api_calls"), "cache_read": u.get("cache_read_tokens"),
-                     "total_tokens": u.get("total_tokens"), "wall_s": res["wall_s"], "rc": res["rc"],
-                     "exit": u.get("turn_exit_reason"), "output_head": res["output"][:600],
-                     "output": res["output"][:20000],  # full reply, so --rescore sees what the scorer saw
-                     "files_written": {k: v[:2000] for k, v in written.items()},
-                     "version": version, "stamp": stamp}
+            for row in score_run(t, res, wd, written, agent=agent, rep=rep, expect=expect, version=version,
+                                 stamp=stamp, judge_model=args.judge_model, use_judge=not args.no_judge):
+                rid, checks, rub, void, cost = row["id"], row["checks"], row["rubric"], row["void"], row["cost_usd"]
+                trap = {"outcome": row["outcome"]} if row["outcome"] else None
+                passed = row["pass"]
                 rows.append(row)
                 with jsonl.open("a") as fh: fh.write(json.dumps(row) + "\n")
                 flag = "VOID" if void else ("PASS" if passed else "FAIL")

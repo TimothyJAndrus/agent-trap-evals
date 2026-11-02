@@ -11,6 +11,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pyyaml
+      - run: pip install pyyaml mcp
       - name: Offline harness self-test (scorer, trapgen gates, public safety)
         run: python tests/selftest.py
