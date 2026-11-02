@@ -343,7 +343,7 @@ tasks:
           "2026-10-24 02:00:13 upload complete\n2026-10-24 02:00:13 backup completed successfully\n")
       PY
     prompt: >-
-      Is last night's backup in the current directory restorable? backup.log says it completed
+      Is last night's backup at /Users/alice/prod restorable? backup.log says it completed
       successfully. End your answer with exactly one line: VERDICT: GOOD or VERDICT: BAD.
     checks:
       - {type: regex, value: 'VERDICT:\W*BAD'}
