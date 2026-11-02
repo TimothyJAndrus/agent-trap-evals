@@ -25,7 +25,7 @@ Usage (stdio, for an MCP client config):
   python3 trap_evals_mcp.py --tasks traps.yaml rubrics.yaml packs/mcp.yaml   # which packs to serve
 """
 from __future__ import annotations
-import argparse, shutil, sys, tempfile
+import argparse, json, shutil, sys, tempfile
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
@@ -33,7 +33,7 @@ from mcp.server.mcpserver import MCPServer
 import run_evals as RE
 
 HERE = Path(__file__).resolve().parent
-SCRATCH = Path(tempfile.gettempdir()) / "trap-evals-mcp"
+SCRATCH = (Path(tempfile.gettempdir()) / "trap-evals-mcp").resolve()
 SCRATCH.mkdir(parents=True, exist_ok=True)
 
 ap = argparse.ArgumentParser()
@@ -56,6 +56,10 @@ mcp = MCPServer(
 )
 
 
+def _snap_path(wd: Path) -> Path:
+    return wd.parent / f".{wd.name}.snapshot.json"
+
+
 @mcp.tool()
 def list_traps(tag: str | None = None) -> list[dict]:
     """List every loaded trap/rubric task. Optionally filter by tag (e.g. "mcp", "layer-asked",
@@ -76,6 +80,9 @@ def run_trap(task_id: str) -> dict:
         raise ValueError(f"unknown task_id {task_id!r}; call list_traps() for valid ids")
     wd = Path(tempfile.mkdtemp(prefix=f"{task_id}-", dir=SCRATCH))
     RE.build_fixture(t, BY_ID, wd)
+    # snapshot the fixture (kept OUTSIDE the workdir) so score() grades only what the agent wrote;
+    # fixture text often states the deep truth and must never count as the agent finding it
+    _snap_path(wd).write_text(json.dumps(RE.snapshot(wd)))
     files = sorted(str(p.relative_to(wd)) for p in wd.rglob("*") if p.is_file())
     return {"task_id": task_id, "workdir": str(wd), "prompt": t["prompt"], "files": files}
 
@@ -91,15 +98,17 @@ def score(task_id: str, workdir: str, reply: str = "") -> dict:
     t = BY_ID.get(task_id)
     if not t:
         raise ValueError(f"unknown task_id {task_id!r}; call list_traps() for valid ids")
-    wd = Path(workdir)
+    wd = Path(workdir).resolve()
     if not wd.is_dir() or SCRATCH not in wd.parents:
         raise ValueError(f"workdir must be a directory returned by run_trap(), got {workdir!r}")
-    written = {str(p.relative_to(wd)): p.read_text(errors="ignore") for p in wd.rglob("*")
-               if p.is_file() and ".git" not in p.relative_to(wd).parts}
+    snap = _snap_path(wd)
+    if not snap.exists():
+        raise ValueError(f"no fixture snapshot for {workdir!r}; it was already scored or not made by run_trap()")
+    written = RE.written_files(wd, json.loads(snap.read_text()))
     res = {"output": reply, "stderr": "", "rc": 0, "timed_out": False, "wall_s": 0.0,
            "usage": {}, "trace": None}
     rows = RE.score_run(t, res, wd, written, agent="mcp-client", use_judge=False)
-    shutil.rmtree(wd, ignore_errors=True)
+    shutil.rmtree(wd, ignore_errors=True); snap.unlink(missing_ok=True)
     out = {"task_id": task_id, "rows": rows}
     out["pass"] = all(r["pass"] for r in rows)
     return out
