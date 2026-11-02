@@ -1,0 +1,66 @@
+name: eval-gate
+# Live agent eval on every PR: rubric + trace scoring against a real model, compared with the
+# committed baseline, posted as one sticky PR comment. Fails on regression or any VOID row.
+# Secrets never reach fork PRs (plain `pull_request`, never `pull_request_target`), so forks
+# get the offline self-test only.
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: write
+concurrency:
+  group: eval-gate-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  MODEL: glm-5.3
+  BASE_URL: https://api.vultrinference.com/v1
+jobs:
+  live-eval:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml
+      - name: Run rubric set against the live model (token budget capped)
+        env:
+          VULTR_INFERENCE_API_KEY: ${{ secrets.VULTR_INFERENCE_API_KEY }}
+        run: |
+          test -n "$VULTR_INFERENCE_API_KEY" || { echo "::error::VULTR_INFERENCE_API_KEY secret not set"; exit 1; }
+          python run_evals.py --tasks traps.yaml rubrics.yaml --tag rubric --no-judge --repeat 2 \
+            --model "$MODEL" --agent-name "bare:$MODEL" --max-total-tokens 400000 \
+            --agent-cmd "python3 {evals_dir}/agents/bare_agent.py --prompt {prompt} --cwd {workdir} --usage {usage_file} --trace {trace_file} --model {model} --base-url $BASE_URL" \
+            || true   # the gate below decides; individual task failures are data
+          ls results/*.jsonl
+      - name: Compare with baseline
+        id: compare
+        run: |
+          set +e
+          python compare.py "$(ls -t results/*.jsonl | head -1)" --baseline baselines/ci.json --out comment.md
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+      - name: Sticky PR comment
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                 -q '.[] | select(.body | startswith("<!-- agent-trap-evals:ci -->")) | .id' | tail -1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comment.md > /dev/null
+          else
+            gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@comment.md > /dev/null
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: |
+            results/
+            comment.md
+      - name: Gate
+        run: test "${{ steps.compare.outputs.rc }}" = "0"

@@ -1,0 +1,42 @@
+name: ai-review
+# Advisory AI review against REVIEW_RUBRIC.md. Findings must quote a real diff line or they are
+# dropped. Never blocks a merge (the eval gate does). Same-repo PRs only, so the key never
+# reaches fork code; the job only reads the diff, it never executes PR code.
+on:
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}   # reviewer code + rubric from base, not the PR
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr diff ${{ github.event.pull_request.number }} --repo "$GITHUB_REPOSITORY" > pr.diff
+      - name: Review
+        env:
+          VULTR_INFERENCE_API_KEY: ${{ secrets.VULTR_INFERENCE_API_KEY }}
+        run: |
+          if [ ! -f review_pr.py ]; then echo "reviewer not on base branch yet; skipping"; echo > review.md; exit 0; fi
+          python review_pr.py --diff pr.diff --out review.md
+      - name: Sticky PR comment
+        if: hashFiles('review.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          [ -s review.md ] && grep -q . review.md || exit 0
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                 -q '.[] | select(.body | startswith("<!-- agent-trap-evals:review -->")) | .id' | tail -1)
+          if [ -n "$id" ]; then gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@review.md > /dev/null
+          else gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@review.md > /dev/null; fi

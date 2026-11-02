@@ -7,6 +7,7 @@ workdir, and a one-paragraph system prompt. Stdlib only, so it runs anywhere pyt
   python3 {evals_dir}/agents/bare_agent.py --prompt {prompt} --cwd {workdir} --usage {usage_file} \\
       --model {model} [--base-url https://api.vultrinference.com/v1] [--env-file PATH]
 
+--trace FILE appends one JSON line per tool call ({"tool", "args", "exit"}) for trace rules.
 Key: $VULTR_INFERENCE_API_KEY (or --key-env NAME), optionally loaded from --env-file (KEY=VALUE lines).
 Usage file: model (as reported by the API), provider, api_calls, total_tokens, completed,
 turn_exit_reason, estimated_cost_usd (only if --usd-per-mtok is given).
@@ -97,6 +98,7 @@ def main() -> int:
     ap.add_argument("--max-turns", type=int, default=30); ap.add_argument("--tool-timeout", type=int, default=60)
     ap.add_argument("--max-tokens", type=int, default=32768)  # reasoning models burn 4k+ on thinking alone
     ap.add_argument("--usd-per-mtok", type=float, help="blended price for a cost estimate")
+    ap.add_argument("--trace", help="append one JSON line per tool call (run_evals {trace_file})")
     a = ap.parse_args()
     load_env(a.env_file)
     key = os.environ.get(a.key_env)
@@ -130,6 +132,11 @@ def main() -> int:
                     out = f"error: arguments were not valid JSON: {e}"
                 else:
                     out = run_tool(c["function"]["name"], args, cwd, a.tool_timeout)
+                if a.trace:
+                    ex = out.split("\n", 1)[0].removeprefix("exit=") if out.startswith("exit=") else None
+                    with open(a.trace, "a") as tf:
+                        tf.write(json.dumps({"tool": c["function"]["name"], "args": args,
+                                             "exit": int(ex) if ex and ex.lstrip("-").isdigit() else None}) + "\n")
                 msgs.append({"role": "tool", "tool_call_id": c["id"], "content": out})
         else:
             u["turn_exit_reason"] = "max_turns"; final = msgs[-1].get("content", "") if msgs[-1]["role"] == "assistant" else ""
