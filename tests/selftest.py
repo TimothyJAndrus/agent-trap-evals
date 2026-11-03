@@ -15,7 +15,7 @@ Offline self-test for the trap harness (what CI runs on every push). No LLM, no 
 Exit code 0 only if everything holds.
 """
 from __future__ import annotations
-import glob, json, os, py_compile, re, subprocess, sys, tempfile
+import glob, json, os, py_compile, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
@@ -89,6 +89,63 @@ for cmd, want in [("cat reports/* 2>/dev/null | head -80", True), ("ls ci report
     ok, _ = RE.check_trace(_rule, [{"tool": "bash", "args": {"command": cmd}}])
     step(f"trace pattern ci-summary: {cmd[:40]!r} -> {want}", ok == want)
 
+# 2d MCP server: in-process client over the real protocol. Fixture text must never count as the
+# agent's finding (a do-nothing agent scored `caught` on 16 rows before the snapshot fix).
+def _mcp_checks():
+    import asyncio
+    from mcp.client import Client
+    import trap_evals_mcp as srv
+    async def go():
+        async with Client(srv.mcp) as c:
+            async def call(name, **kw):
+                r = await c.call_tool(name, kw)
+                return json.loads(r.content[0].text) if r.content else {}
+            names = sorted(t.name for t in (await c.list_tools()).tools)
+            step("mcp: exposes list_traps/run_trap/score", names == ["list_traps", "run_trap", "score"], str(names))
+            emb = [t for t in srv.ALL_TASKS if t.get("trap_score") or t.get("trap_scores")]
+            wrong = []
+            for t in emb:
+                wd = (await call("run_trap", task_id=t["id"]))["workdir"]
+                for row in (await call("score", task_id=t["id"], workdir=wd))["rows"]:
+                    if row["outcome"] not in ("abstained", "missing"): wrong.append(f"{row['id']}={row['outcome']}")
+            step("mcp: do-nothing agent is never credited with a catch", not wrong, f"{len(emb)} tasks" + (f"; {wrong[:4]}" if wrong else ""))
+            for d in sorted(glob.glob(str(HERE / "packs" / "drafts" / "mcp-*.yaml"))):
+                doc = yaml.safe_load(open(d)); val = doc["validation"]
+                eid = next(t["id"] for t in doc["tasks"] if t.get("arm") == "embedded")
+                for name, sample, want in [("fooled", val["emb_fooled"], False), ("caught", val["emb_caught"], True)]:
+                    wd = (await call("run_trap", task_id=eid))["workdir"]
+                    for f, body in (sample.get("files") or {}).items(): (Path(wd) / f).write_text(body)
+                    got = await call("score", task_id=eid, workdir=wd, reply=sample.get("reply", ""))
+                    step(f"mcp: {eid} {name} sample -> pass={want}", got["pass"] is want, got["rows"][0]["outcome"])
+    asyncio.run(go())
+try:
+    _mcp_checks()
+except ImportError as e:
+    step("mcp: package importable", False, str(e))
+
+# 2e bare_agent bash confinement. A live run once read ~/.hermes, ran `gh auth token` and hit the
+# GitHub API with the operator's credential. Env scrub is checked everywhere; the filesystem and
+# network checks need sandbox-exec, so they run on macOS only (CI runners are throwaway VMs).
+sys.path.insert(0, str(HERE / "agents")); import bare_agent as BA
+for root in [Path(tmp), Path.home() / ".cache"] if sys.platform == "darwin" else [Path(tmp)]:
+    root.mkdir(parents=True, exist_ok=True)
+    wd = Path(tempfile.mkdtemp(prefix="sbx-", dir=root))
+    os.environ["SELFTEST_CANARY_SECRET"] = "x" * 32
+    sh = lambda c: BA.run_tool("bash", {"command": c}, wd, 30)
+    step(f"sandbox[{root.name}]: workdir read/write + git work", "git-ok" in sh("echo hi > a && cat a && git init -q . && git status -s >/dev/null && echo git-ok"))
+    step(f"sandbox[{root.name}]: no inherited secrets in env", "SELFTEST_CANARY" not in sh("env"))
+    step(f"sandbox[{root.name}]: HOME is not the operator's", str(Path.home()) != sh("echo $HOME").split("--- stdout\n")[1].split("\n")[0])
+    if sys.platform == "darwin":
+        real = Path.home(); canary = real / f".sbx-canary-{wd.name}"
+        step(f"sandbox[{root.name}]: cannot list the operator's home", "Operation not permitted" in sh(f"ls {real}"))
+        sh(f"echo x > {canary}")
+        step(f"sandbox[{root.name}]: cannot write into the operator's home", not canary.exists())
+        canary.unlink(missing_ok=True)
+        step(f"sandbox[{root.name}]: no network", "000" in sh("curl -s -m 5 -o /dev/null -w '%{http_code}' https://example.com"))
+        step(f"sandbox[{root.name}]: no gh credential", "oauth token" in sh("gh auth token 2>&1 || true") or "not found" in sh("gh auth token 2>&1 || true"))
+    os.environ.pop("SELFTEST_CANARY_SECRET", None)
+    shutil.rmtree(wd, ignore_errors=True); shutil.rmtree(wd.parent / f".{wd.name}.sbx", ignore_errors=True)
+
 # 2c regression gate (compare.py): same run passes; a drop, a VOID, or a deleted task blocks
 def _rows(spec):  # spec: list of (id, pass, score, void)
     f = Path(tmp) / f"cmp-{abs(hash(str(spec)))}.jsonl"
@@ -113,7 +170,6 @@ for d in sorted(glob.glob(str(HERE / "packs" / "drafts" / "*.yaml"))):
     step(f"trapgen gates: {Path(d).stem}", r.returncode == 0, "; ".join(errs)[:300])
 
 # 4 starter pack digest flags vs recorded paraphrases (build into a temp copy; don't touch the repo)
-import shutil
 pack_tmp = Path(tmp) / "starter.yaml"; shutil.copy(HERE / "packs" / "starter.yaml", pack_tmp)
 r = run([PY, "trapgen.py", "digest", str(pack_tmp)])
 step("starter pack: flags match all paraphrases", r.returncode == 0, (r.stdout + r.stderr).strip().splitlines()[-1][:300] if (r.stdout + r.stderr).strip() else "")

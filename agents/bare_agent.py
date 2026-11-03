@@ -50,10 +50,48 @@ def inside(cwd: Path, p: str) -> Path:
     return q
 
 
-def run_tool(name: str, args: dict, cwd: Path, timeout: int) -> str:
+# bash runs confined to the workdir. Without this, a live run of mcp-overbroad-scope walked out of
+# its scratch dir, read the operator's shell rc files and ~/.hermes, ran `gh auth token`, and called
+# the GitHub API with the operator's real credential. An eval harness must never hand the subject
+# the host. Layers: (1) scrubbed env (HOME=workdir, no inherited secrets such as the inference key),
+# (2) on macOS, sandbox-exec: no network, no reads or writes under the user's home except the workdir.
+SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+
+
+def _sandbox_profile(cwd: Path, side: Path) -> str:
+    home = str(Path.home().resolve())
+    w, sd = str(cwd.resolve()), str(side.resolve())
+    # stat (not read) of the workdir's ancestors, so git/python can resolve a workdir under $HOME
+    anc = [a for a in map(str, cwd.resolve().parents) if a.startswith(home)]
+    meta = " ".join(f'(literal "{a}")' for a in anc)
+    return f"""(version 1)
+(allow default)
+(deny network*)
+(allow network* (local unix))
+(deny file-read* file-write* (subpath "{home}") (subpath "/Volumes"))
+(allow file-read* file-write* (subpath "{w}") (subpath "{sd}"))
+{f"(allow file-read-metadata {meta})" if meta else ""}
+(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd"))
+"""
+
+
+def bash_argv(command: str, cwd: Path, sandbox: str) -> tuple[list[str], dict]:
+    # HOME/TMPDIR live in a sibling dir so tool caches (~/Library, ~/.npm) never show up as
+    # files the agent "wrote" in the workdir
+    side = cwd.parent / f".{cwd.name}.sbx"; (side / "tmp").mkdir(parents=True, exist_ok=True)
+    env = {"PATH": SAFE_PATH, "HOME": str(side), "TMPDIR": str(side / "tmp"), "LANG": "C.UTF-8",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+    argv = ["bash", "--noprofile", "--norc", "-c", command]
+    if sandbox == "auto" and sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").exists():
+        argv = ["/usr/bin/sandbox-exec", "-p", _sandbox_profile(cwd, side)] + argv
+    return argv, env
+
+
+def run_tool(name: str, args: dict, cwd: Path, timeout: int, sandbox: str = "auto") -> str:
     try:
         if name == "bash":
-            r = subprocess.run(["bash", "-c", args["command"]], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+            argv, env = bash_argv(args["command"], cwd, sandbox)
+            r = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
             out = f"exit={r.returncode}\n--- stdout\n{r.stdout}\n--- stderr\n{r.stderr}"
         elif name == "read_file":
             out = inside(cwd, args["path"]).read_text(errors="replace")
@@ -99,6 +137,8 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=32768)  # reasoning models burn 4k+ on thinking alone
     ap.add_argument("--usd-per-mtok", type=float, help="blended price for a cost estimate")
     ap.add_argument("--trace", help="append one JSON line per tool call (run_evals {trace_file})")
+    ap.add_argument("--sandbox", choices=["auto", "env-only"], default="auto",
+                    help="auto: scrubbed env + sandbox-exec on macOS (no network, no home dir); env-only: scrubbed env")
     a = ap.parse_args()
     load_env(a.env_file)
     key = os.environ.get(a.key_env)
@@ -131,7 +171,7 @@ def main() -> int:
                 except json.JSONDecodeError as e:
                     out = f"error: arguments were not valid JSON: {e}"
                 else:
-                    out = run_tool(c["function"]["name"], args, cwd, a.tool_timeout)
+                    out = run_tool(c["function"]["name"], args, cwd, a.tool_timeout, a.sandbox)
                 if a.trace:
                     ex = out.split("\n", 1)[0].removeprefix("exit=") if out.startswith("exit=") else None
                     with open(a.trace, "a") as tf:
