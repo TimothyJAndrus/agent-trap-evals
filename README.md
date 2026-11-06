@@ -14,6 +14,15 @@ A trap set and harness for scoring AI agents on one specific failure: claiming s
 
 Scoring is deterministic (regex rules over the reply and the files the agent wrote), with an optional LLM judge. No hosted service is involved.
 
+Part of the **trusted-agent stack**, four small open-source pieces for running AI agents a company can trust:
+
+| | Question it answers |
+|---|---|
+| [agent-credential-broker](https://github.com/TimothyJAndrus/agent-credential-broker) | What can the agent **access**? Short-lived, scoped credentials. |
+| [agent-guardrails](https://github.com/TimothyJAndrus/agent-guardrails) | What can the agent **do**, and who approved it? Policy and human approval on every tool call. |
+| **agent-trap-evals** | Is the agent's output **true**? Traps a shallow check passes and a deeper check fails. |
+| [note-taking-service](https://github.com/TimothyJAndrus/note-taking-service) | A real app using them: cited Q&A over team notes, and an MCP server behind the gate. |
+
 ## Why it exists
 Agents rarely fail the direct question ("is the backup OK?"). They fail when the claim is a **side effect of a chore**: a status roll-up, a release note, a "mark it fixed." So each trap has three arms:
 
